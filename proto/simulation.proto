@@ -1,0 +1,129 @@
+syntax = "proto3";
+
+package patient_simulator.v1;
+
+option go_package = "github.com/patient-simulator/engine/proto/v1;pb";
+
+import "google/protobuf/timestamp.proto";
+
+// ------------------------------------------------------------------
+// PDES Engine Service
+// ------------------------------------------------------------------
+service SimulationEngine {
+  // Retrieve a state snapshot at a specific simulation time.
+  rpc GetStateSnapshot(GetStateSnapshotRequest) returns (StateSnapshot);
+
+  // Submit an agent intent for validation and (if approved) execution.
+  rpc SubmitIntent(SubmitIntentRequest) returns (IntentResult);
+
+  // Stream patient events generated between time barriers.
+  rpc StreamPatientEvents(StreamPatientEventsRequest) returns (stream PatientEvent);
+
+  // Inject a disease trajectory into the simulation.
+  rpc InjectDisease(InjectDiseaseRequest) returns (InjectDiseaseResult);
+}
+
+// ------------------------------------------------------------------
+// A. State Snapshot
+// ------------------------------------------------------------------
+message StateSnapshot {
+  string version_hash = 1;               // Deterministic hash of this snapshot
+  google.protobuf.Timestamp sim_time = 2;
+  repeated VitalSign vitals = 3;
+  repeated ActiveDrug active_drugs = 4;
+  repeated AgentMessage pending_messages = 5;
+  float sdi_score = 6;                   // Simulation Distress Index (0-1)
+  float shared_effect_compartment = 7;   // Directional Bliss shared effect
+}
+
+message VitalSign {
+  string metric_code = 1;   // e.g. "hr", "map", "rr", "spo2", "temp_c"
+  double value = 2;
+  string unit = 3;
+  google.protobuf.Timestamp measured_at = 4;
+}
+
+message ActiveDrug {
+  string drug_name = 1;
+  double current_rate = 2;   // mg/hr or mcg/min, depending on drug
+  string unit = 3;
+  google.protobuf.Timestamp started_at = 4;
+}
+
+message AgentMessage {
+  string from_agent_id = 1;
+  string to_agent_id = 2;
+  string priority = 3;       // CRITICAL | ROUTINE
+  string body = 4;
+  google.protobuf.Timestamp sent_at = 5;
+}
+
+// ------------------------------------------------------------------
+// B. Agent Intent
+// ------------------------------------------------------------------
+message AgentIntent {
+  string agent_id = 1;
+  string action_type = 2;        // ADMINISTER_MED | ADJUST_VENT | CALL_ATTENDING | etc.
+  bytes payload = 3;             // JSON-encoded action details
+  google.protobuf.Timestamp proposed_time = 4;
+  string based_on_hash = 5;      // For causal violation detection
+}
+
+message SubmitIntentRequest {
+  string simulation_id = 1;
+  AgentIntent intent = 2;
+}
+
+message IntentResult {
+  enum Status {
+    STATUS_UNSPECIFIED = 0;
+    APPROVED = 1;
+    REJECTED_DOSE_EXCEEDS_LIMIT = 2;
+    REJECTED_ROUTE_INVALID = 3;
+    REJECTED_CAUSAL_VIOLATION = 4;
+    ROLLED_BACK = 5;
+    FAILURE_TO_ACT = 6;
+  }
+  Status status = 1;
+  string rejection_reason = 2;
+  string resulting_version_hash = 3;
+}
+
+// ------------------------------------------------------------------
+// C. Patient Event
+// ------------------------------------------------------------------
+message PatientEvent {
+  string event_type = 1;         // CALL_BELL | SYMPTOM_REPORT | CODE_BLUE | etc.
+  string trigger_reason = 2;
+  google.protobuf.Timestamp sim_time = 3;
+  string patient_id = 4;
+}
+
+message StreamPatientEventsRequest {
+  string simulation_id = 1;
+  google.protobuf.Timestamp from_time = 2;
+  google.protobuf.Timestamp to_time = 3;
+}
+
+// ------------------------------------------------------------------
+// D. Disease Injection
+// ------------------------------------------------------------------
+message InjectDiseaseRequest {
+  string simulation_id = 1;
+  string disease_type = 2;       // OCCULT_HEMORRHAGE | SEPSIS | etc.
+  bytes trajectory_params = 3;   // JSON-encoded DiseaseTrajectory
+  google.protobuf.Timestamp onset_time = 4;
+}
+
+message InjectDiseaseResult {
+  bool accepted = 1;
+  string trajectory_id = 2;
+}
+
+// ------------------------------------------------------------------
+// Request types
+// ------------------------------------------------------------------
+message GetStateSnapshotRequest {
+  string simulation_id = 1;
+  google.protobuf.Timestamp sim_time = 2;
+}

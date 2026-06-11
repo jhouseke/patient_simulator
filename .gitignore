@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+# Pulse build artifacts
+third_party/pulse/builds/
+*.so
+# Large data — never commit datasets
+data/vitaldb/
+data/mimic/
+data/exports/
+# Secrets
+.env

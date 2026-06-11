@@ -1,0 +1,61 @@
+version: "3.9"
+
+services:
+  db:
+    build:
+      context: .
+      dockerfile: db/Dockerfile
+    container_name: psim-db
+    environment:
+      POSTGRES_USER: psim
+      POSTGRES_PASSWORD: psim_dev
+      POSTGRES_DB: patient_simulator
+    ports:
+      - "5432:5432"
+    volumes:
+      - psim_pgdata:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/db_healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 10
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    command: >
+      postgres
+      -c shared_preload_libraries='timescaledb,age'
+      -c shared_buffers=512MB
+      -c max_connections=200
+      -c log_line_prefix='%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+      -c log_checkpoints=on
+      -c log_connections=on
+      -c log_disconnections=on
+      -c log_lock_waits=on
+      -c log_temp_files=0
+      -c log_autovacuum_min_duration=0
+      -c log_error_verbosity=default
+
+  # ------------------------------------------------------------------
+  # Fallback: standalone Apache AGE if triple-extension stack fails.
+  # Activate with: docker compose --profile age-fallback up -d
+  # ------------------------------------------------------------------
+  age:
+    image: apache/age:latest
+    container_name: psim-age
+    profiles: ["age-fallback"]
+    environment:
+      POSTGRES_USER: psim
+      POSTGRES_PASSWORD: psim_dev
+      POSTGRES_DB: patient_simulator_graph
+    ports:
+      - "5433:5432"
+    volumes:
+      - psim_agedata:/var/lib/postgresql/data
+
+volumes:
+  psim_pgdata:
+  psim_agedata:
