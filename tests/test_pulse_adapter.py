@@ -59,3 +59,43 @@ def test_pulse_unit_keys_are_known():
         assert req.pulse_unit in PULSE_UNIT_KEYS, (
             f"{req.metric_code}: unknown pulse_unit {req.pulse_unit!r}"
         )
+
+
+# ----------------------------------------------------------------------
+# Adapter construction — importable and configurable without Pulse installed
+# ----------------------------------------------------------------------
+
+
+def test_adapter_module_imports_without_pulse():
+    """`import pulse` must be deferred to initialize()."""
+    from engine.physiology.pulse_adapter import PatientConfig, PulseAdapter
+
+    cfg = PatientConfig(sex="MALE", age_yr=65, height_cm=175, weight_kg=80)
+    adapter = PulseAdapter(seed=42, patient_cfg=cfg)
+    assert adapter.seed == 42
+    assert adapter.cfg.age_yr == 65
+
+
+def test_adapter_rejects_unknown_waveform_channel():
+    from engine.physiology.pulse_adapter import PatientConfig, PulseAdapter
+
+    cfg = PatientConfig(sex="MALE", age_yr=65, height_cm=175, weight_kg=80)
+    with pytest.raises(ValueError):
+        PulseAdapter(seed=1, patient_cfg=cfg, waveform_channels=("NOPE",))
+
+
+def test_adapter_requires_initialize_before_use():
+    from engine.physiology.pulse_adapter import PatientConfig, PulseAdapter
+
+    cfg = PatientConfig(sex="MALE", age_yr=65, height_cm=175, weight_kg=80)
+    adapter = PulseAdapter(seed=1, patient_cfg=cfg)
+    with pytest.raises(RuntimeError, match="initialize"):
+        adapter.sample_scalars()
+
+
+def test_advance_is_a_noop_for_nonpositive_durations():
+    from engine.physiology.pulse_adapter import PatientConfig, PulseAdapter
+
+    cfg = PatientConfig(sex="MALE", age_yr=65, height_cm=175, weight_kg=80)
+    adapter = PulseAdapter(seed=1, patient_cfg=cfg)
+    adapter.advance(0.0)  # must not require an engine
