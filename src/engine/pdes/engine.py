@@ -13,17 +13,19 @@ Manages the simulation lifecycle:
 
 from __future__ import annotations
 
-import copy
+import json
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 import structlog
 
 from engine.pdes.clock import PDESClock, TimeBarrier
 from engine.pdes.snapshot import build_snapshot
+from engine.physiology.actions import intent_to_pulse_action
 from engine.proto.v1 import simulation_pb2 as pb
 from engine.store.postgres import PostgresStore
+from engine.validators.constraint import ConstraintValidator, ValidationError
 
 logger = structlog.get_logger()
 
@@ -45,6 +47,7 @@ class RollbackCheckpoint:
     barrier_time: datetime
     version_hash: str
     committed_intents: list[IntentRecord] = field(default_factory=list)
+    physiology_state: bytes | None = None
 
 
 class CausalViolation(Exception):
@@ -71,21 +74,44 @@ class PDES_Engine:
     MAX_ROLLBACK_DEPTH = 2
     BARRIER_MINUTES = 15
 
+    #: Default cadence at which scalar vitals are sampled *within* a barrier.
+    #: Barriers control when agents deliberate; charting controls output
+    #: resolution. VitalDB (our calibration reference) records at 1-2 s, so one
+    #: sample per 15-minute barrier would be useless for research.
+    CHARTING_INTERVAL_S = 5.0
+
     def __init__(
         self,
         store: PostgresStore | None,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
         patient_id: int = 1,
+        physiology=None,                          # PulseAdapter | None
+        barrier_seconds: float | None = None,
+        charting_interval_s: float = CHARTING_INTERVAL_S,
+        scenario=None,                            # ScenarioStateMachine | None
     ) -> None:
         self.store = store
-        self.clock = PDESClock(start_time, end_time)
+        self.barrier_seconds = (
+            float(barrier_seconds)
+            if barrier_seconds is not None
+            else self.BARRIER_MINUTES * 60.0
+        )
+        self.clock = PDESClock(start_time, end_time, interval_s=self.barrier_seconds)
         self.patient_id = patient_id
+        self.physiology = physiology
+        self.charting_interval_s = charting_interval_s
+        self.scenario = scenario
+        #: Optional Callable[[datetime, dict[str, float]], None] observer.
+        self.on_vitals_sampled: Callable[[datetime, dict[str, float]], None] | None = None
         self._agents: dict[str, Callable[[pb.StateSnapshot], pb.AgentIntent]] = {}
         self._checkpoints: list[RollbackCheckpoint] = []
         self._current_version_hash = ""
         self._rollback_count = 0
         self._sequential_mode = False
+        self._validator = ConstraintValidator()
+        if self.physiology is not None:
+            self.physiology.initialize()
 
     def register_agent(
         self,
@@ -109,6 +135,13 @@ class PDES_Engine:
         self.clock.current_time = barrier.sim_time
         logger.info("barrier_start", time=barrier.sim_time.isoformat())
 
+        # A scenario policy sets this barrier's cadence before anything else
+        # happens, so the clock's next step and the physiology advance agree.
+        elapsed = (barrier.sim_time - self.clock.start_time).total_seconds()
+        if self.scenario is not None:
+            self.barrier_seconds = float(self.scenario.barrier_seconds(elapsed))
+            self.clock.interval_s = self.barrier_seconds
+
         # Build snapshot at barrier time
         snapshot = await build_snapshot(self.store, barrier.sim_time, self.patient_id)
         self._current_version_hash = snapshot.version_hash
@@ -117,11 +150,85 @@ class PDES_Engine:
         checkpoint = RollbackCheckpoint(
             barrier_time=barrier.sim_time,
             version_hash=snapshot.version_hash,
+            physiology_state=(
+                self.physiology.save_state() if self.physiology is not None else None
+            ),
         )
         self._checkpoints.append(checkpoint)
 
+        # Scripted scenario actions go through the SAME validate -> commit ->
+        # apply path as agent intents, so they get identical safety checks and
+        # audit trail (Arch Decision 7).
+        if self.scenario is not None:
+            await self._commit_scenario_actions(barrier, snapshot, elapsed)
+
         # Deliberate and commit with rollback support
         await self._deliberate_and_commit(snapshot, barrier, depth=0)
+
+        # Advance physiology across the barrier, charting as we go
+        await self._advance_physiology(barrier)
+
+    async def _commit_scenario_actions(
+        self, barrier: TimeBarrier, snapshot: pb.StateSnapshot, elapsed: float
+    ) -> None:
+        """Commit phase-entry and scheduled-event actions from the scenario."""
+        for spec in self.scenario.pending_action_specs(elapsed):
+            action_type = spec["action_type"]
+            payload = {k: v for k, v in spec.items() if k != "action_type"}
+            try:
+                self._validator.validate({"action_type": action_type, **payload})
+            except ValidationError as exc:
+                # Scripted scenarios must be safe by construction; a failure
+                # here is a bug in the scenario library, not agent behavior.
+                logger.error(
+                    "scenario_action_failed_validation", spec=spec, reason=exc.reason
+                )
+                continue
+            record = IntentRecord(
+                agent_id="SCENARIO",
+                action_type=action_type,
+                payload=payload,
+                proposed_time=barrier.sim_time,
+                based_on_hash=snapshot.version_hash,
+                raw=None,
+            )
+            await self._commit_single(record, snapshot.version_hash)
+
+    async def _advance_physiology(self, barrier: TimeBarrier) -> None:
+        """Advance Pulse across the barrier, charting scalars as we go.
+
+        Charting runs at `charting_interval_s` (default 5 s) rather than once
+        per barrier: barriers control deliberation cadence, not data resolution
+        (Arch Decision 8). Samples are batched into a single DB round-trip.
+        """
+        if self.physiology is None:
+            return
+
+        # Never advance past the simulation end — the clock yields a barrier at
+        # end_time itself, which must not run a further interval of physiology.
+        remaining = (self.clock.end_time - barrier.sim_time).total_seconds()
+        total = min(self.barrier_seconds, max(remaining, 0.0))
+        if total <= 0:
+            return
+
+        elapsed = 0.0
+        batch: list[tuple[datetime, dict[str, float]]] = []
+        while elapsed < total:
+            step = min(self.charting_interval_s, total - elapsed)
+            self.physiology.advance(step)
+            elapsed += step
+            batch.append(
+                (
+                    barrier.sim_time + timedelta(seconds=elapsed),
+                    self.physiology.sample_scalars(),
+                )
+            )
+
+        if self.store:
+            await self.store.insert_vitals_batch(self.patient_id, batch, source="engine")
+        if self.on_vitals_sampled:
+            for sample_time, vitals in batch:
+                self.on_vitals_sampled(sample_time, vitals)
 
     async def _deliberate_and_commit(
         self,
@@ -247,9 +354,18 @@ class PDES_Engine:
                 intent.proposed_time,
                 intent.agent_id,
                 intent.action_type,
-                intent.payload,
+                # agent_actions.payload is JSONB and no asyncpg JSON codec is
+                # registered, so hand it a JSON string, not a dict.
+                json.dumps(intent.payload),
                 intent.based_on_hash,
             )
+
+        # Translate the approved intent into a Pulse action. Intents with no
+        # physiologic effect (CALL_ATTENDING, CHECK_VITALS) map to None.
+        if self.physiology is not None:
+            pulse_action = intent_to_pulse_action(intent.action_type, intent.payload)
+            if pulse_action is not None:
+                self.physiology.apply_action(pulse_action)
 
         logger.debug(
             "intent_committed",
@@ -282,18 +398,37 @@ class PDES_Engine:
                 checkpoint.barrier_time,
             )
 
+        # Revert physiology to the checkpoint so a rolled-back drug does not
+        # leave its effect in the engine.
+        if self.physiology is not None and checkpoint.physiology_state is not None:
+            self.physiology.load_state(checkpoint.physiology_state)
+
         self._current_version_hash = checkpoint.version_hash
 
     @staticmethod
     def _pb_to_record(pb_intent: pb.AgentIntent) -> IntentRecord:
-        """Convert protobuf AgentIntent to internal IntentRecord."""
-        from google.protobuf.json_format import MessageToDict
+        """Convert protobuf AgentIntent to internal IntentRecord.
 
-        proposed_time = pb_intent.proposed_time.ToDatetime()
+        `AgentIntent.payload` is JSON-encoded bytes holding the action details
+        (drug_name, dose, route, ...), so it is decoded here rather than
+        wrapping the whole message — the validator, the Pulse action mapper,
+        and the agent_actions audit row all want the action details themselves.
+        """
+        proposed_time = pb_intent.proposed_time.ToDatetime(tzinfo=timezone.utc)
+        payload: dict[str, Any] = {}
+        if pb_intent.payload:
+            try:
+                payload = json.loads(pb_intent.payload.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                logger.warning(
+                    "intent_payload_not_json",
+                    agent=pb_intent.agent_id,
+                    action=pb_intent.action_type,
+                )
         return IntentRecord(
             agent_id=pb_intent.agent_id,
             action_type=pb_intent.action_type,
-            payload=MessageToDict(pb_intent),
+            payload=payload,
             proposed_time=proposed_time,
             based_on_hash=pb_intent.based_on_hash,
             raw=pb_intent,

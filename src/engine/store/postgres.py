@@ -9,7 +9,8 @@ three extensions live in one PostgreSQL process (Week 1 gate).
 from __future__ import annotations
 
 import os
-from typing import Any
+from datetime import datetime
+from typing import Any, Sequence
 
 import asyncpg
 
@@ -49,6 +50,54 @@ class PostgresStore:
             raise RuntimeError("PostgresStore not connected")
         async with self._pool.acquire() as conn:
             return await conn.execute(query, *args)
+
+    # ------------------------------------------------------------------
+    # Vital signs
+    # ------------------------------------------------------------------
+
+    async def insert_vitals(
+        self,
+        patient_id: int,
+        time: datetime,
+        vitals: dict[str, float],
+        source: str = "engine",
+    ) -> None:
+        """Upsert one timestamp's worth of vitals."""
+        await self.insert_vitals_batch(patient_id, [(time, vitals)], source=source)
+
+    async def insert_vitals_batch(
+        self,
+        patient_id: int,
+        samples: Sequence[tuple[datetime, dict[str, float]]],
+        source: str = "engine",
+    ) -> None:
+        """Upsert many timestamps in one round-trip.
+
+        samples: [(time, {metric_code: value}), ...]
+
+        The batched form exists because charting runs at ~5 s cadence: a
+        15-minute barrier produces 180 sample dicts, and per-sample round-trips
+        would dominate barrier wall time.
+        """
+        records = [
+            (t, patient_id, code, float(value), source)
+            for t, vitals in samples
+            for code, value in vitals.items()
+        ]
+        if not records:
+            return
+        if not self._pool:
+            raise RuntimeError("PostgresStore not connected")
+        async with self._pool.acquire() as conn:
+            await conn.executemany(
+                """
+                INSERT INTO vital_signs (time, patient_id, metric_code, value, source)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (time, patient_id, metric_code, source)
+                DO UPDATE SET value = EXCLUDED.value
+                """,
+                records,
+            )
 
     async def cypher(self, graph_name: str, query: str) -> list[asyncpg.Record]:
         """

@@ -9,7 +9,7 @@ in Week 2.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Callable
 
 
@@ -33,21 +33,35 @@ class PDESClock:
         self,
         start_time: datetime | None = None,
         end_time: datetime | None = None,
+        interval_s: float | None = None,
     ) -> None:
-        self.start_time = start_time or datetime.utcnow()
+        self.start_time = start_time or datetime.now(timezone.utc)
         self.end_time = end_time or (self.start_time + timedelta(hours=24))
         self.current_time = self.start_time
+        # Mutable so a scenario can change cadence between barriers (fine during
+        # induction/intubation, coarse in maintenance/ICU). Read fresh on every
+        # iteration of barriers().
+        self.interval_s = (
+            float(interval_s) if interval_s is not None else self.BARRIER_MINUTES * 60.0
+        )
         self._barrier_callbacks: list[Callable[[TimeBarrier], None]] = []
 
     def register_callback(self, callback: Callable[[TimeBarrier], None]) -> None:
         self._barrier_callbacks.append(callback)
 
     def barriers(self):
-        """Generate time barriers from start to end."""
+        """Generate time barriers from start to end.
+
+        `interval_s` is re-read each iteration, so a consumer may change the
+        cadence from inside the loop (see ScenarioStateMachine).
+        """
         t = self.start_time
         while t <= self.end_time:
             yield TimeBarrier(sim_time=t)
-            t += timedelta(minutes=self.BARRIER_MINUTES)
+            step = self.interval_s
+            if step <= 0:
+                raise ValueError("barrier interval_s must be positive")
+            t += timedelta(seconds=step)
 
     async def run(self) -> None:
         """
