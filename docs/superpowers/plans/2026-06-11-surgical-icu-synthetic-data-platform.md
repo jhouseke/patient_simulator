@@ -6,7 +6,7 @@
 
 **Architecture:** The hand-rolled SciPy PK/PD code and parametric disease injector are **demoted from "physiology truth" to fast surrogates**. The [Pulse Physiology Engine](https://pulse.kitware.com) (Kitware, Apache-2.0, C++ with Python bindings) becomes the single source of physiological truth: one Pulse engine instance per simulated patient, advanced in lockstep with the PDES barrier loop. Pulse emits scalar vitals **and** continuous waveforms at its native 50 Hz timestep (airway pressure, capnography, flow/volume); seeded morphology synthesizers driven by Pulse's beat-level outputs generate the monitor-rate channels (ECG 250 Hz, arterial pressure and pleth 125 Hz) that Pulse cannot natively produce at clinical sample rates. A scenario state machine adds OR phases (preop → induction → intubation → maintenance → emergence → extubation → PACU/ICU) as a *policy* over the same engine loop. LLM clinical agents (OpenAI-compatible endpoint — local vLLM by default, cloud **only with Zero Data Retention enabled**, see Architecture Decision 10; temperature 0.3) drive care decisions and generate narrative notes. A cohort sampler + batch runner + multi-format exporter (Parquet / WFDB / FHIR) produce datasets at scale. Two real datasets calibrate the system: **VitalDB** (intraoperative high-resolution vitals + waveforms + infusion rates) for physiologic/waveform fidelity, and **MIMIC-IV** (ICU EHR + MIMIC-IV-Note + MIMIC-IV waveforms) for clinical-course and narrative calibration.
 
-**Tech Stack:** Python 3.11+, Pulse Physiology Engine (Python bindings), TimescaleDB + pgvector + Apache AGE (PostgreSQL 16), gRPC/protobuf, asyncpg, NumPy/SciPy, vLLM (OpenAI-compatible server) + an open-weights instruct model, PyArrow/Parquet, `wfdb` (WFDB I/O), `vitaldb` (VitalDB API), `sentence-transformers` (384-dim embeddings for agent memory), `pytest`/`pytest-asyncio`, Docker Compose.
+**Tech Stack:** Python 3.13 (Pulse's pybind11 2.13.1 rules out 3.14), Pulse Physiology Engine (built from source, Python bindings), TimescaleDB + pgvector + Apache AGE (PostgreSQL 16), gRPC/protobuf, asyncpg, NumPy/SciPy, vLLM (OpenAI-compatible server) + an open-weights instruct model, PyArrow/Parquet, `wfdb` (WFDB I/O), `vitaldb` (VitalDB API), `sentence-transformers` (384-dim embeddings for agent memory), `pytest`/`pytest-asyncio`, Docker Compose.
 
 ---
 
@@ -31,7 +31,7 @@ The work is split into **six phases**, each independently testable and each prod
 **Conventions used throughout:**
 - All new engine code lives under `src/engine/`. Run tests with `PYTHONPATH=src python -m pytest`.
 - `metric_code` strings extend the existing set in `src/engine/pdes/snapshot.py::_metric_unit`.
-- Pulse Python API symbol names below follow the Pulse 4.x `PyPulse`/`pulse.cdm` conventions. **Pulse IS published on PyPI as `pulse-physiology-engine`** — Phase 0 Task 0.2 tries the wheel first (this is an Apple-Silicon host, so verify a linux/arm64 wheel exists for the container) and falls back to a source build only if no usable wheel is found. Exact symbol names MUST be confirmed against the version installed in Phase 0 Task 0.2 (see that task for the verification command). Where a name is uncertain it is wrapped behind our own adapter (`src/engine/physiology/pulse_adapter.py`) so the rest of the codebase never imports Pulse directly.
+- **`docs/pulse_api_notes.md` is the authoritative Pulse reference** — API surface, build recipe, and gotchas read from the pinned source (`REL_4_3_2`). Read it before writing any physiology code. **Pulse is NOT pip-installable**; it is built from source in the engine image (Task 0.2). Items marked `CONFIRM` there are unverified until the build exists. All Pulse imports stay inside `src/engine/physiology/pulse_adapter.py` so the rest of the codebase never imports Pulse directly.
 - **Anchor edits to function/class names, never to line numbers** — line references drift as tasks land. Where this plan says "in `_commit_single`" etc., locate the symbol, don't count lines.
 
 ---
@@ -120,7 +120,7 @@ tests/
 └── test_calibration.py             # cross-cutting
 
 scripts/
-├── build_pulse.sh                  # Phase 0 — source-build fallback if no PyPI wheel works
+├── build_pulse.sh                  # Phase 0 — source build of Pulse + Python bindings
 ├── run_single_sim.py               # Phase 1 — CLI to run one patient end-to-end
 ├── bench_pulse.py                  # Phase 1 — sim-speed + save_state cost benchmark (Task 1.8)
 └── run_cohort.py                   # Phase 5 — CLI to launch a cohort
@@ -177,81 +177,82 @@ Only if the user confirms `internal/` and `cmd/` are dead. If yes:
 git rm -r internal cmd && git commit -m "chore: remove abandoned Go engine scaffolding"
 ```
 
-### Task 0.2: Install Pulse with Python bindings in the container
+### Task 0.2: Build Pulse with Python bindings in the container
 
-Kitware publishes Pulse Python wheels on PyPI as **`pulse-physiology-engine`** — try that FIRST; it reduces this task to a pip install. Compile from source (gitlab.kitware.com/physiology/engine) only if no wheel works for the container platform. Note: this is an Apple-Silicon host, so the container needs a **linux/arm64** wheel; if only amd64 wheels exist, weigh Rosetta emulation (`platform: linux/amd64`, slower for a CPU-bound physiology engine) against the source build. Either way the install is isolated in an `engine` Docker image so contributors never build anything on the host.
+**Pulse must be compiled from source — it is NOT on PyPI** (verified: a scan of the full PyPI simple index finds no Kitware physiology package under any name). The build recipe below is taken from Pulse's own `Dockerfile` at tag `REL_4_3_2`; see `docs/pulse_api_notes.md` for the complete API/build reference captured from source. We isolate the build in an `engine` Docker image so contributors never build it on the host.
+
+Key facts (all verified against `REL_4_3_2`):
+- Tag format is **`REL_4_3_2`**, not `v4.4.0`.
+- The CMake option is **`Pulse_PYTHON_API`** (`Pulse_BUILD_PYTHON`/`Pulse_PYTHON_BINDINGS` do not exist), and configure runs from the **repo root** (it's a superbuild that fetches Eigen3/protobuf/abseil/pybind11), not `src/`.
+- `Pulse_JAVA_API` defaults **ON** and needs a JDK — turn it OFF.
+- Runtime needs **both** `/pulse/bin` (compiled `PyPulse` + data files) and `/pulse/python` (the `pulse` package) on `PYTHONPATH`.
+- Pulse pins **pybind11 v2.13.1 → Python ≤ 3.13**. Do not use 3.14 in the engine image.
 
 **Files:**
-- Create: `scripts/build_pulse.sh` (fallback path only)
+- Create: `scripts/build_pulse.sh`
 - Create: `engine.Dockerfile`
 - Modify: `docker-compose.yml` (add an `engine` service)
-- Modify: `requirements.txt` (wheel path only)
 
-- [ ] **Step 1: Try the PyPI wheel first**
+- [ ] **Step 1: Confirm a container runtime exists**
 
-Run:
-```bash
-docker run --rm python:3.11-bookworm bash -c \
-  "pip install --no-cache-dir pulse-physiology-engine && python -c 'import pulse; print(\"pulse import OK\")'"
-```
-Expected: `pulse import OK`. If it prints OK: add `pulse-physiology-engine` (pinned to the resolved version) to `requirements.txt`, **skip Step 2 entirely**, use the simple pip-based `engine.Dockerfile` in Step 3, and record in `data/README.md` that the wheel path was taken. If pip finds no compatible linux/arm64 wheel, retry with `docker run --platform linux/amd64 ...`; only if neither works, fall back to Step 2.
+Run: `docker info`
+This machine had no Docker installed at plan time — install Docker Desktop or Colima first. On Apple Silicon, prefer a native `linux/arm64` build (Pulse is CPU-bound; emulation costs several-fold).
 
-- [ ] **Step 2 (fallback — ONLY if Step 1 found no usable wheel): Write `scripts/build_pulse.sh`**
+- [ ] **Step 2: Write `scripts/build_pulse.sh`**
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
 # Builds the Pulse Physiology Engine with Python bindings.
-# Pin to a known-good tag; bump deliberately, never float on main.
-PULSE_TAG="${PULSE_TAG:-4.4.0}"
+# Pin to a known-good tag; bump deliberately, never float on a branch.
+# Tag format is REL_<major>_<minor>_<patch>.
+PULSE_TAG="${PULSE_TAG:-REL_4_3_2}"
 PULSE_SRC="/opt/pulse/engine"
 PULSE_BUILD="/opt/pulse/build"
+PULSE_INSTALL="/pulse"
 
-git clone --depth 1 --branch "v${PULSE_TAG}" \
-    https://gitlab.kitware.com/physiology/engine.git "${PULSE_SRC}" || \
-  (cd "${PULSE_SRC}" && git fetch --depth 1 origin "v${PULSE_TAG}" && git checkout "v${PULSE_TAG}")
+git clone --depth 1 --branch "${PULSE_TAG}" \
+    https://gitlab.kitware.com/physiology/engine.git "${PULSE_SRC}"
 
-cmake -S "${PULSE_SRC}/src" -B "${PULSE_BUILD}" \
-    -DCMAKE_BUILD_TYPE=Release \
-    -DPulse_BUILD_PYTHON=ON \
-    -DPulse_PYTHON_BINDINGS=ON
+# Superbuild: configure from the REPO ROOT; it fetches and builds its own
+# dependencies (Eigen3, protobuf, abseil, pybind11 v2.13.1).
+cmake -S "${PULSE_SRC}" -B "${PULSE_BUILD}" \
+    -DCMAKE_BUILD_TYPE:STRING=Release \
+    -DCMAKE_INSTALL_PREFIX="${PULSE_INSTALL}" \
+    -DPulse_PYTHON_API:BOOL=ON \
+    -DPulse_JAVA_API:BOOL=OFF \
+    -DPulse_CSHARP_API:BOOL=OFF \
+    -DPulse_DOWNLOAD_BASELINES:BOOL=OFF
 cmake --build "${PULSE_BUILD}" --config Release -j "$(nproc)"
-
-# Expose the built python package + data files on PYTHONPATH
-# (python:3.11-bookworm keeps site-packages under /usr/local/lib, not /usr/lib)
-echo "${PULSE_BUILD}/install/python" > /usr/local/lib/python3.11/site-packages/pulse.pth
 ```
 
-> NOTE FOR IMPLEMENTER: Pulse's exact CMake flag names and the install layout vary by version. Consult the ReadMe of the pinned tag (`https://gitlab.kitware.com/physiology/engine/-/blob/v${PULSE_TAG}/ReadMe.md`). The goal is: after this script, `python -c "import pulse"` works and Pulse's `bin`/data directory is locatable. Record the working flags in this file.
+> NOTE FOR IMPLEMENTER: this is a long superbuild (tens of minutes). If it fails, consult the pinned tag's ReadMe (`https://gitlab.kitware.com/physiology/engine/-/blob/REL_4_3_2/ReadMe.md`) — Pulse's own Dockerfile uses clang with `-stdlib=libc++` on debian:bullseye, which is the known-good toolchain if the default GCC path gives trouble. Record whatever flags actually work back into this script.
 
 - [ ] **Step 3: Write `engine.Dockerfile`**
 
-Wheel path (preferred — `pulse-physiology-engine` is in `requirements.txt`):
+Build Pulse in a separate stage so day-to-day image rebuilds don't recompile it:
 ```dockerfile
-FROM python:3.11-bookworm
-WORKDIR /app
-COPY requirements.txt pyproject.toml ./
-RUN pip install --no-cache-dir -r requirements.txt -e ".[dev]"
-COPY . .
-ENV PYTHONPATH=/app/src
-CMD ["python", "-m", "engine.main"]
-```
-
-Source-build fallback (only if Step 2 was needed):
-```dockerfile
-FROM python:3.11-bookworm
+# ---- stage 1: compile Pulse (slow; cached) ----
+FROM python:3.13-bookworm AS pulse-build
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential cmake git ninja-build libeigen3-dev && \
+    build-essential cmake git ninja-build && \
     rm -rf /var/lib/apt/lists/*
-WORKDIR /app
 COPY scripts/build_pulse.sh /tmp/build_pulse.sh
 RUN bash /tmp/build_pulse.sh
+
+# ---- stage 2: engine runtime ----
+FROM python:3.13-bookworm
+COPY --from=pulse-build /pulse /pulse
+WORKDIR /app
 COPY requirements.txt pyproject.toml ./
 RUN pip install --no-cache-dir -r requirements.txt -e ".[dev]"
 COPY . .
-ENV PYTHONPATH=/app/src
+# /pulse/bin holds the compiled PyPulse extension AND the runtime data files;
+# /pulse/python holds the `pulse` package. BOTH are required.
+ENV PYTHONPATH=/app/src:/pulse/bin:/pulse/python
 CMD ["python", "-m", "engine.main"]
 ```
+> Python 3.13, not 3.14: Pulse pins pybind11 v2.13.1, which does not support 3.14. (torch, needed by `sentence-transformers` in Phase 4, has the same ceiling.)
 
 - [ ] **Step 4: Add the `engine` service to `docker-compose.yml`**
 
@@ -271,7 +272,6 @@ Add under `services:` (alongside the existing `db`):
     volumes:
       - ./src:/app/src
       - ./data:/app/data
-    # platform: linux/amd64   # uncomment ONLY if forced onto the amd64 wheel via emulation (Step 1)
 ```
 
 - [ ] **Step 5: Build the image and verify Pulse imports**
@@ -279,27 +279,28 @@ Add under `services:` (alongside the existing `db`):
 Run:
 ```bash
 docker compose build engine
-docker compose run --rm engine python -c "import pulse; print('pulse import OK')"
+docker compose run --rm engine python -c "from pulse.engine.PulseEngine import PulseEngine, version; print('pulse OK', version())"
 ```
-Expected: prints `pulse import OK` with no traceback. If it fails, fix the install path (wheel pin or `build_pulse.sh` flags) before proceeding — **do not** continue to Phase 1 until this passes.
+Expected: prints `pulse OK` and a version string with no traceback. If it fails, fix `build_pulse.sh` before proceeding — **do not** continue to the real-Pulse parts of Phase 1 until this passes.
 
-- [ ] **Step 6: Capture the real Pulse API surface for the adapter**
+- [ ] **Step 6: Verify the API surface against `docs/pulse_api_notes.md`**
 
-Run and save the output into a scratch note (this is the authoritative reference for Task 1.1):
+`docs/pulse_api_notes.md` already records the API read from source at `REL_4_3_2` and flags every uncertain item with `CONFIRM`. Resolve those against the live build:
 ```bash
 docker compose run --rm engine python - <<'PY'
-import pulse, inspect
-import pulse.cdm.engine as eng  # adjust module path per version
-print([n for n in dir(pulse) if not n.startswith('_')])
+from pulse.cdm.engine import SEDataRequest
+from pulse.cdm import patient_actions as pa
+print("request factories:", [n for n in dir(SEDataRequest) if n.startswith("create_")])
+print("admin routes:", list(pa.eSubstance_Administration))
 PY
 ```
-Expected: a list of public symbols (engine factory, patient initialization, action classes, data-request classes). Use these exact names in Task 1.1.
+Then update `docs/pulse_api_notes.md` in place: confirm `CoreTemperature`/`CentralVenousPressure` are valid physiology request names, enumerate the available substances, and settle the §6 open questions (especially **whether any inhaled-volatile delivery path exists** — Phase 3 `MAINTENANCE` depends on it, and Pulse 4.x appears to have dropped the anesthesia machine).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add engine.Dockerfile docker-compose.yml requirements.txt   # + scripts/build_pulse.sh if Step 2 was needed
-git commit -m "build: install Pulse Physiology Engine with Python bindings in engine image"
+git add engine.Dockerfile docker-compose.yml scripts/build_pulse.sh docs/pulse_api_notes.md
+git commit -m "build: compile Pulse Physiology Engine with Python bindings in engine image"
 ```
 
 ### Task 0.3: Confirm dataset access (VitalDB + MIMIC-IV)
@@ -372,11 +373,19 @@ class PulseAdapter:
     def initialize(self) -> None: ...                      # stabilize to a starting state
     def advance(self, seconds: float) -> None: ...          # run physiology forward
     def apply_action(self, action: "PulseAction") -> None: ...
-    def sample_scalars(self) -> dict[str, float]: ...       # {metric_code: value}
+    def sample_scalars(self) -> dict[str, float]: ...       # {metric_code: value} at NOW
     def save_state(self) -> bytes: ...                      # for rollback
     def load_state(self, blob: bytes) -> None: ...
     def close(self) -> None: ...
 ```
+
+> **`advance()` implementation constraint** (`docs/pulse_api_notes.md` §3): Pulse's
+> `advance_time_s(n)` runs n seconds' worth of timesteps but calls `pull_data()`
+> **only once, at the end** — every intermediate timestep is discarded, and
+> `pull_data()` returns an instantaneous snapshot, never a series. So:
+> - **Scalars** (5 s charting cadence): `advance_time_s(5.0)` then `sample_scalars()` is fine, and is what the engine's charting loop does.
+> - **Waveforms** (Phase 2, 50 Hz): `advance_time_s()` cannot be used — `advance()` must loop Pulse's single-timestep `advance_time()` and pull each step, accumulating into the waveform buffers. Build `advance()` this way from the start so Phase 2 doesn't have to re-architect it: loop `advance_time()` for `round(seconds / dt)` steps, capture per-step values when waveform channels are registered, and mirror Pulse's own `_spare_time_s` carry so repeated calls don't drift.
+> - `pull_data()` returns a flat list whose **first element is simulation time**; our requests start at index 1.
 
 ### Task 1.1: `PatientConfig` + `PulseAdapter` wrapping the Pulse engine
 
@@ -557,10 +566,15 @@ SCALAR_REQUESTS: list[ScalarRequest] = [
     ScalarRequest("spo2",   "OxygenSaturation",         "unitless", convert=lambda x: x * 100.0),
     ScalarRequest("etco2",  "EndTidalCarbonDioxidePressure", "mmHg"),
     ScalarRequest("temp_c", "CoreTemperature",          "degC"),
-    ScalarRequest("co",     "CardiacOutput",            "mL/min",  convert=lambda x: x / 1000.0),  # -> L/min
+    ScalarRequest("co",     "CardiacOutput",            "L/min"),
     ScalarRequest("cvp",    "CentralVenousPressure",    "mmHg"),
 ]
 ```
+Constraints from `docs/pulse_api_notes.md` §4 that this table must respect:
+- `OxygenSaturation` really is **unitless 0..1** in Pulse — the ×100 is required.
+- `CardiacOutput` can be requested directly as `VolumePerTimeUnit.L_Per_min`, so **no mL/min→L/min conversion** is needed.
+- `pulse_unit` here is a *string key*; the adapter maps it to the real Pulse unit object (`FrequencyUnit.Per_min`, `PressureUnit.mmHg`, `TemperatureUnit.C`, `VolumePerTimeUnit.L_Per_min`, …) when calling `SEDataRequest.create_physiology_request(name, unit=...)`.
+- `CoreTemperature` and `CentralVenousPressure` are marked `CONFIRM` — Pulse's own default set uses `SkinTemperature`. Verify both at Task 0.2 Step 6 before relying on them.
 
 - [ ] **Step 4: Run to verify it passes**
 
@@ -695,6 +709,9 @@ def test_administer_med_maps_to_substance_bolus():
     assert isinstance(action, SubstanceBolus)
     assert action.substance == "Propofol"
     assert action.dose_mg == 100.0
+    # Pulse takes a VOLUME + concentration, not a mass: 100 mg at 10 mg/mL = 10 mL
+    assert action.concentration_mg_per_ml == 10.0
+    assert action.volume_ml == 10.0
 
 def test_unknown_action_returns_none():
     from engine.physiology.actions import intent_to_pulse_action
@@ -725,9 +742,30 @@ SUBSTANCE_MAP = {
     "Norepi": "Norepinephrine",
 }
 
+# Pulse's SESubstanceBolus takes a VOLUME (SEScalarVolume) plus a
+# concentration (SEScalarMassPerVolume) — NOT a mass. A clinical order of
+# "propofol 100 mg IV" must therefore be converted to a vial concentration and
+# a syringe volume. These are standard formulation strengths; extend as drugs
+# are added, and keep them consistent with ConstraintValidator's dose limits.
+CONCENTRATION_MG_PER_ML = {
+    "Propofol": 10.0,
+    "Fentanyl": 0.05,
+    "Rocuronium": 10.0,
+    "Sugammadex": 100.0,
+    "Succinylcholine": 20.0,
+    "Midazolam": 1.0,
+    "Norepinephrine": 0.016,
+    "Phenylephrine": 0.1,
+}
+DEFAULT_CONCENTRATION_MG_PER_ML = 10.0
+
 
 def _canon(name: str) -> str:
     return SUBSTANCE_MAP.get(name, name)
+
+
+def _concentration_for(substance: str) -> float:
+    return CONCENTRATION_MG_PER_ML.get(substance, DEFAULT_CONCENTRATION_MG_PER_ML)
 
 
 class PulseAction:
@@ -739,7 +777,19 @@ class PulseAction:
 class SubstanceBolus(PulseAction):
     substance: str
     dose_mg: float
-    def to_pulse(self):  # PULSE: SESubstanceBolus(IV route, mass dose)
+    concentration_mg_per_ml: float = DEFAULT_CONCENTRATION_MG_PER_ML
+
+    @property
+    def volume_ml(self) -> float:
+        """Pulse wants a volume; clinicians order a mass."""
+        return self.dose_mg / self.concentration_mg_per_ml
+
+    def to_pulse(self):
+        # PULSE: SESubstanceBolus — set_substance(name),
+        # set_admin_route(eSubstance_Administration.Intravenous),
+        # get_dose().set_value(self.volume_ml, VolumeUnit.mL),
+        # get_concentration().set_value(self.concentration_mg_per_ml,
+        #                               MassPerVolumeUnit.mg_Per_mL)
         raise NotImplementedError
 
 
@@ -747,8 +797,13 @@ class SubstanceBolus(PulseAction):
 class SubstanceInfusion(PulseAction):
     substance: str
     rate_mg_per_min: float
-    concentration_mg_per_ml: float = 10.0
-    def to_pulse(self):  # PULSE: SESubstanceInfusion(rate, concentration)
+    concentration_mg_per_ml: float = DEFAULT_CONCENTRATION_MG_PER_ML
+
+    @property
+    def rate_ml_per_min(self) -> float:
+        return self.rate_mg_per_min / self.concentration_mg_per_ml
+
+    def to_pulse(self):  # PULSE: SESubstanceInfusion(rate as volume/time, concentration)
         raise NotImplementedError
 
 
@@ -766,10 +821,14 @@ def intent_to_pulse_action(action_type: str, payload: dict) -> PulseAction | Non
     if action_type == "ADMINISTER_MED":
         sub = _canon(payload.get("drug_name", payload.get("drug", "")))
         route = payload.get("route", "")
+        conc = float(payload.get("concentration_mg_per_ml", _concentration_for(sub)))
         if route.endswith("bolus"):
-            return SubstanceBolus(substance=sub, dose_mg=float(payload.get("dose", 0.0)))
+            return SubstanceBolus(substance=sub, dose_mg=float(payload.get("dose", 0.0)),
+                                  concentration_mg_per_ml=conc)
         return SubstanceInfusion(
-            substance=sub, rate_mg_per_min=float(payload.get("rate", payload.get("rate_mg_per_min", 0.0)))
+            substance=sub,
+            rate_mg_per_min=float(payload.get("rate", payload.get("rate_mg_per_min", 0.0))),
+            concentration_mg_per_ml=conc,
         )
     if action_type == "ADJUST_VENT":
         return VentilatorSettings(
@@ -1141,7 +1200,9 @@ git commit -m "perf: Pulse advance/save_state benchmark + recorded budget"
 
 **Channels (`channel` codes):** `ART` (arterial pressure, mmHg, 125 Hz, **synthesized**), `PLETH` (pleth, unitless, 125 Hz, **synthesized**), `CO2` (capnography, mmHg, 50 Hz, Pulse-native), `AWP` (airway pressure, cmH2O, 50 Hz, Pulse-native), `FLOW` (mL/s, 50 Hz, Pulse-native), `VOL` (mL, 50 Hz, Pulse-native), `ECG_II` (mV, 250 Hz, **synthesized**).
 
-> **Why synthesized (Arch Decision 9):** Pulse advances at a fixed 0.02 s timestep — 50 Hz is the maximum rate it can natively emit, so 125/250 Hz channels cannot come straight from Pulse. CO2/AWP/FLOW/VOL are read directly at 50 Hz during `advance()`. ART/PLETH/ECG_II morphology is generated per-beat from Pulse's beat-level outputs (HR, SBP/DBP/MAP, SpO2) by seeded, **stateful** generators (beat phase carries across windows — no seams), and calibrated against VitalDB in the Phase 2 gate. Never upsample a 50 Hz Pulse trace and label it 125 Hz.
+> **Why synthesized (Arch Decision 9):** Pulse advances at a fixed 0.02 s timestep — 50 Hz is the maximum rate it can natively emit, so 125/250 Hz channels cannot come straight from Pulse. CO2/AWP/FLOW/VOL are read directly at 50 Hz during `advance()` — which requires the **per-timestep `advance_time()` loop** described in the Phase 1 adapter contract, because `advance_time_s()` discards intermediate samples. ART/PLETH/ECG_II morphology is generated per-beat from Pulse's beat-level outputs (HR, SBP/DBP/MAP, SpO2) by seeded, **stateful** generators (beat phase carries across windows — no seams), and calibrated against VitalDB in the Phase 2 gate. Never upsample a 50 Hz Pulse trace and label it 125 Hz.
+>
+> **Pulse does have a native ECG**, contrary to an earlier draft of this plan: `SEDataRequest.create_ecg_request("Lead3ElectricPotential", unit=ElectricPotentialUnit.mV)` emits Lead III at the 50 Hz engine timestep. It is not a substitute for a 250 Hz Lead II, but it **is** a free cross-check for the synthesizer — request it alongside and compare rate/rhythm in the Phase 2 gate.
 
 ### Task 2.1: Waveform chunk schema + store helper
 
@@ -1596,6 +1657,8 @@ def phase_config(phase: Phase) -> PhaseConfig:
 
 > NOTE: `INTUBATE`, `EXTUBATE`, inhaled volatile (`Sevoflurane` MAC), `Rocuronium`, and `Sugammadex` require new branches in `engine/physiology/actions.py` and new `ConstraintValidator` dose limits. Add those in Task 3.2 — do not leave them unmapped.
 
+> ⚠️ **BLOCKER TO RESOLVE BEFORE THIS TASK:** Pulse 4.x appears to have **no anesthesia machine** — `equipment_actions.py` at `REL_4_3_2` defines only the `SEEquipmentAction` base, and older Pulse versions' anesthesia machine is gone. If there is no inhaled-volatile delivery path, `MAINTENANCE` as written (Sevoflurane at 1.0 MAC) cannot be driven by Pulse at all. Settle this at Task 0.2 Step 6 (`docs/pulse_api_notes.md` §6 open question 1). Preferred fallback: run maintenance as **TIVA** — propofol + remifentanil/fentanyl infusions, which map cleanly to `SESubstanceInfusion` — and treat volatile agents as a later enhancement. That is also clinically defensible for a surgical-ICU dataset. Decide before writing `phases.py`, since the phase's `entry_action_specs` encode the choice.
+
 - [ ] **Step 4: Run to verify it passes**
 
 Run: `docker compose run --rm engine python -m pytest tests/test_scenario_machine.py -v`
@@ -1678,9 +1741,13 @@ class InhaledAnesthetic(PulseAction):
 
 @dataclass
 class Hemorrhage(PulseAction):
-    severity: float                 # 0..1 -> Pulse hemorrhage severity/flow
-    compartment: str = "Abdomen"
-    def to_pulse(self):  # PULSE: SEHemorrhage(compartment, severity)
+    severity: float                 # 0..1 -> SEHemorrhage severity
+    # Pulse compartments are ANATOMIC (eHemorrhage_Compartment): Aorta, Brain,
+    # Muscle, LargeIntestine, Left/RightArm, Left/RightKidney, Left/RightLeg,
+    # Liver, Skin, SmallIntestine, Splanchnic, Spleen, VenaCava.
+    # There is no "Abdomen" — use Liver/Spleen/Splanchnic for an intra-abdominal bleed.
+    compartment: str = "Liver"
+    def to_pulse(self):  # PULSE: SEHemorrhage(type=Internal, compartment, severity)
         raise NotImplementedError
 ```
 and in `intent_to_pulse_action`, before the final `return None`:
@@ -2807,8 +2874,8 @@ markers = ["slow: requires Pulse, a live model, or large datasets"]
 
 # Risk Register (monitor during execution)
 
-1. **Pulse API drift / platform availability (MED — was HIGH).** Downgraded: Pulse ships PyPI wheels (`pulse-physiology-engine`), so Phase 0 tries pip first. Residual risk is wheel availability for linux/arm64 (Apple-Silicon host) — fallbacks in order: amd64 wheel under emulation, source build (`build_pulse.sh`), and finally driving Pulse as a subprocess over its C++ executable + protobuf scenario files. All Pulse calls stay isolated in `pulse_adapter.py`, so any fallback preserves the same interface.
-2. **Pulse substance coverage (MED).** Rocuronium, sugammadex, sevoflurane, and some pressors may not ship as Pulse substances. Where missing, define custom Pulse substances from literature PK/PD, or fall back to the existing SciPy surrogate for that drug's effect while logging the gap. Never silently no-op a drug (this applies to `INJECT_EVENT` disease types too).
+1. **Pulse source build (HIGH).** Confirmed not pip-installable — every path requires compiling a large C++ superbuild. The exact flags and tag are now known and recorded (`docs/pulse_api_notes.md`), which removes the guesswork, but the build itself is still the biggest schedule risk: tens of minutes, and it must produce a working pybind11 extension for Python 3.13 on linux/arm64. Mitigations: multi-stage Dockerfile so it's built once and cached; clang+libc++ per Pulse's own Dockerfile if GCC fails; and if the bindings cannot be built at all, drive Pulse as a subprocess over its C++ executable + protobuf scenario files. All Pulse calls stay isolated in `pulse_adapter.py`, so any fallback preserves the same interface. **Prerequisite: no container runtime was installed on the dev machine — Docker/Colima must be set up first.**
+2. **Pulse substance & equipment coverage (HIGH — raised from MED).** Two distinct gaps. (a) *Substances*: rocuronium, sugammadex, sevoflurane, and some pressors may not ship as Pulse substances (the substance set is generated from `Data.xlsx`, so it can only be enumerated after a build). (b) *Equipment*: **Pulse 4.x appears to have dropped the anesthesia machine**, which would leave inhaled volatiles with no delivery path and directly blocks Phase 3 `MAINTENANCE` as specified — see the blocker note in Task 3.1. Mitigations, in order: prefer TIVA (propofol/remifentanil infusions) over volatiles for maintenance; define custom Pulse substances from literature PK/PD; fall back to the SciPy surrogate for a drug's effect while logging the gap. Never silently no-op a drug (this applies to `INJECT_EVENT` disease types too). Also note Pulse's bolus API takes a **volume + concentration, not a mass** — see `docs/pulse_api_notes.md` §5.
 3. **Waveform volume at cohort scale (MED).** Chunked arrays + TimescaleDB compression keep this bounded, but a 1000-patient × 6-hour cohort with 7 channels is large. Task 1.8 produces the storage/wall-clock extrapolation BEFORE Phase 5; validate the compression ratio on the Task 5.4 run; consider exporting waveforms straight to WFDB files and storing only pointers in the DB if storage balloons.
 4. **Wall-clock cost of Pulse + state checkpointing (MED).** Pulse runs ~5–10× real time single-threaded, and `save_state()` every barrier may dominate short-barrier phases (15 s intubation barriers). Task 1.8 measures both; the `physiology_checkpoint_every` escape hatch (checkpoint every N barriers + intent replay on rollback) is specified there.
 5. **Synthesized waveform realism (MED).** ART/PLETH/ECG morphology is generated, not simulated (Pulse's 0.02 s timestep caps native output at 50 Hz — Arch Decision 9). The VitalDB spectral/amplitude gate in Phase 2 is the guard; document the synthesis provenance in the dataset datasheet so downstream users don't mistake generated morphology for modeled physiology.
