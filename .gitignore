@@ -15,3 +15,5 @@ data/mimic/
 data/exports/
 # Secrets
 .env
+# macOS
+.DS_Store
