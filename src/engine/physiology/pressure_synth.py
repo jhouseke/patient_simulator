@@ -16,6 +16,8 @@ SNUADC/ART and SNUADC/PLETH in the Phase 2 gate.
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 
 _TEMPLATE_N = 2048
@@ -102,6 +104,13 @@ class PressureSynthesizer:
         # Beat phase in cycles [0, 1). Shared by ART and PLETH.
         self.beat_phase = 0.0
 
+    def snapshot_state(self) -> dict:
+        return {"beat_phase": self.beat_phase, "rng": copy.deepcopy(self.rng.bit_generator.state)}
+
+    def restore_state(self, state: dict) -> None:
+        self.rng.bit_generator.state = copy.deepcopy(state["rng"])
+        self.beat_phase = float(state["beat_phase"])
+
     def _advance_phase(self, n: int, heart_rate_bpm) -> np.ndarray:
         """Return per-sample beat phase in cycles and carry the state forward."""
         hr = np.broadcast_to(np.asarray(heart_rate_bpm, dtype=float), (n,))
@@ -133,12 +142,14 @@ class PressureSynthesizer:
         heart_rate_bpm,
         sbp_mmhg,
         dbp_mmhg,
+        *, phase_cycles=None,
     ) -> np.ndarray:
         """Arterial pressure in mmHg; peaks track SBP, troughs track DBP."""
-        n = int(round(duration_s * self.fs))
+        n = len(phase_cycles) if phase_cycles is not None else int(round(duration_s * self.fs))
         if n <= 0:
             return np.zeros(0)
-        phase = self._advance_phase(n, heart_rate_bpm)
+        phase = (self._advance_phase(n, heart_rate_bpm) if phase_cycles is None
+                 else np.asarray(phase_cycles, dtype=float) % 1.0)
         shape = self._sample_template(_ART_TEMPLATE, phase)
         sbp = np.broadcast_to(np.asarray(sbp_mmhg, dtype=float), (n,))
         dbp = np.broadcast_to(np.asarray(dbp_mmhg, dtype=float), (n,))
@@ -151,16 +162,18 @@ class PressureSynthesizer:
         heart_rate_bpm,
         spo2_pct=98.0,
         perfusion: float = 1.0,
+        *, phase_cycles=None,
     ) -> np.ndarray:
         """Normalized [0, 1] pleth. Amplitude scales with perfusion."""
-        n = int(round(duration_s * self.fs))
+        n = len(phase_cycles) if phase_cycles is not None else int(round(duration_s * self.fs))
         if n <= 0:
             return np.zeros(0)
-        phase = self._advance_phase(n, heart_rate_bpm)
+        phase = (self._advance_phase(n, heart_rate_bpm) if phase_cycles is None
+                 else np.asarray(phase_cycles, dtype=float) % 1.0)
         shape = self._sample_template(_PLETH_TEMPLATE, phase)
         amp = float(np.clip(perfusion, 0.05, 1.0))
         noise = self.rng.normal(0.0, self.pleth_noise, n)
         # Desaturation dims the pulsatile amplitude a little, as real probes show.
-        sat_scale = float(np.clip(np.mean(spo2_pct) / 100.0, 0.5, 1.0))
+        sat_scale = np.clip(np.asarray(spo2_pct, dtype=float) / 100.0, 0.5, 1.0)
         sig = 0.5 * (1.0 - amp * sat_scale) + amp * sat_scale * shape + noise
         return np.clip(sig, 0.0, 1.0)

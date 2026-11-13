@@ -19,6 +19,7 @@ scripted-vs-agent mode switch.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import copy
 
 from engine.scenario.phases import PHASE_ORDER, Phase, phase_config
 
@@ -45,6 +46,7 @@ class ScenarioStateMachine:
         self.on_phase_enter = None
         self._entered_idx = -1
         self._fired_events: set[int] = set()
+        self._phase_notifications: list[Phase] = []
 
     # ------------------------------------------------------------------
     # Policy interface consumed by PDES_Engine
@@ -69,6 +71,26 @@ class ScenarioStateMachine:
     def barrier_seconds(self, elapsed_s: float) -> float:
         return phase_config(self.phase_at(elapsed_s)).barrier_seconds
 
+    def next_event_s(self, elapsed_s: float) -> float | None:
+        """Next phase boundary or insult, so the engine never steps over it."""
+        times = [self.phase_start_s(p) for p in PHASE_ORDER]
+        times.extend(self.phase_start_s(e["phase"]) + e["at_s"]
+                     for i, e in enumerate(self.scenario.events) if i not in self._fired_events)
+        future = [t for t in times if t > elapsed_s]
+        return min(future) if future else None
+
+    def snapshot_state(self):
+        return copy.deepcopy((self._entered_idx, self._fired_events, self._phase_notifications))
+
+    def restore_state(self, state) -> None:
+        self._entered_idx, self._fired_events, self._phase_notifications = copy.deepcopy(state)
+
+    def publish_notifications(self) -> None:
+        pending, self._phase_notifications = self._phase_notifications, []
+        for phase in pending:
+            if self.on_phase_enter:
+                self.on_phase_enter(phase)
+
     def pending_action_specs(self, elapsed_s: float) -> list[dict]:
         """Phase-entry actions on transition, plus scenario events now due."""
         specs: list[dict] = []
@@ -80,8 +102,7 @@ class ScenarioStateMachine:
             # so a coarse cadence never steps over a short phase silently.
             for i in range(self._entered_idx + 1, idx + 1):
                 crossed = PHASE_ORDER[i]
-                if self.on_phase_enter:
-                    self.on_phase_enter(crossed)
+                self._phase_notifications.append(crossed)
                 specs.extend(phase_config(crossed).entry_action_specs)
             self._entered_idx = idx
 

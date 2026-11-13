@@ -11,6 +11,8 @@ reproducibility. Calibrated against VitalDB ECG_II spectra in the Phase 2 gate.
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 
 # (center_angle_rad, gaussian_width, amplitude_mV) for P,Q,R,S,T
@@ -40,13 +42,21 @@ class ECGSynthesizer:
         self._t = 0.0          # continuous time across calls (wander phase)
         self._phase = -np.pi   # beat phase, carried across calls (no seams)
 
-    def generate(self, duration_s: float, heart_rate_bpm) -> np.ndarray:
+    def snapshot_state(self) -> dict:
+        return {"t": self._t, "phase": self._phase, "rng": copy.deepcopy(self.rng.bit_generator.state)}
+
+    def restore_state(self, state: dict) -> None:
+        self.rng.bit_generator.state = copy.deepcopy(state["rng"])
+        self._t = float(state["t"])
+        self._phase = float(state["phase"])
+
+    def generate(self, duration_s: float, heart_rate_bpm, *, phase_cycles=None) -> np.ndarray:
         """Return `duration_s` of Lead-II signal in mV.
 
         heart_rate_bpm may be a scalar or a per-sample array — pass Pulse's
         instantaneous HR series to get beat-to-beat variability.
         """
-        n = int(round(duration_s * self.fs))
+        n = len(phase_cycles) if phase_cycles is not None else int(round(duration_s * self.fs))
         if n <= 0:
             return np.zeros(0)
 
@@ -56,6 +66,9 @@ class ECGSynthesizer:
         phase = self._phase + np.cumsum(dphi)
         self._phase = float(np.angle(np.exp(1j * phase[-1])))
 
+        if phase_cycles is not None:
+            phase = 2 * np.pi * np.asarray(phase_cycles)
+            self._phase = float(np.angle(np.exp(1j * phase[-1])))
         wrapped = np.angle(np.exp(1j * phase))
         sig = np.zeros(n)
         for center, width, amp in _WAVES:

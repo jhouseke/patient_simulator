@@ -1,5 +1,7 @@
 # Surgical-ICU Synthetic Data Platform — Implementation Plan
 
+> **Fidelity implementation update:** See [fidelity foundations](../../fidelity_implementation.md) for the implemented event scheduler, complete adapter replay, observation layer, clinical challenge evaluator, example phenotype sampler, synchronized waveforms, and testing instructions. These additions do not close the real-Pulse, database, or clinical calibration acceptance gates below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Execute phases **in order** — each phase depends on interfaces defined in the previous one. Do **not** skip the TDD steps (write failing test → see it fail → implement → see it pass → commit).
 
 **Goal:** Turn the existing ICU PDES scaffold into a system that generates large, validated, multi-modal synthetic datasets (scalar vitals + high-frequency waveforms + clinical narratives + medication/event logs) for surgical-ICU and OR patients, suitable for anesthesiology safety research.

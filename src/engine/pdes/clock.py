@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Callable
+import math
 
 
 @dataclass
@@ -58,10 +59,15 @@ class PDESClock:
         t = self.start_time
         while t <= self.end_time:
             yield TimeBarrier(sim_time=t)
+            if t == self.end_time:
+                break
             step = self.interval_s
-            if step <= 0:
+            if not math.isfinite(step) or step <= 0:
                 raise ValueError("barrier interval_s must be positive")
-            t += timedelta(seconds=step)
+            next_t = min(t + timedelta(seconds=step), self.end_time)
+            if next_t <= t:
+                raise ValueError("barrier interval is below clock resolution")
+            t = next_t
 
     async def run(self) -> None:
         """

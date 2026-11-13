@@ -4,7 +4,7 @@
 -- ------------------------------------------------------------------
 
 -- Narrow table for flexible vital sign types.
--- source: 'engine' | 'agent' | 'ipc'
+-- source: 'truth' | 'observed' | 'engine' (legacy) | 'agent' | 'ipc'
 CREATE TABLE IF NOT EXISTS vital_signs (
     time        TIMESTAMPTZ NOT NULL,
     patient_id  INT NOT NULL,
